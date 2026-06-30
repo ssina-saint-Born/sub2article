@@ -1,0 +1,74 @@
+{
+  "name": "subscribe-ai",
+  "version": "1.0.0",
+  "author": "SubScribe AI",
+  "description": "SubScribe AI - Intelligent Subtitle & Image Processing Desktop App",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "icon": "node electron/icon.cjs",
+    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron . --dev\"",
+    "electron:build": "vite build && node electron/icon.cjs && node -e \"require('fs').accessSync('dist/index.html')\" && electron-builder",
+    "start": "electron ."
+  },
+  "build": {
+    "appId": "com.subscribeai.app",
+    "productName": "SubScribe AI",
+    "copyright": "Copyright © 2026 SubScribe AI",
+    "directories": {
+      "output": "release",
+      "buildResources": "public"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "!electron/icon.cjs"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/tesseract.js/**/*",
+      "node_modules/tesseract.js-core/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "public/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "public/icon.ico",
+      "uninstallerIcon": "public/icon.ico",
+      "installerHeaderIcon": "public/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SubScribe AI"
+    }
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^8.2.2",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.41",
+    "tailwindcss": "^3.4.10",
+    "vite": "^5.4.2",
+    "wait-on": "^7.2.0"
+  }
+}
