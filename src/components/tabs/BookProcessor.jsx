@@ -10,6 +10,12 @@ import {
   fileToDataUrl,
   toTesseractLang,
 } from '../../utils/ocrEngine';
+import {
+  putImage,
+  getImage,
+  deleteImage,
+  clearAllImages,
+} from '../../utils/imageStore';
 import { exportToDocx, exportToPdf } from '../../utils/exportUtils';
 import { callLLM } from '../../utils/apiClient';
 import { getDatasetPrompt } from '../../utils/prompts';
@@ -147,7 +153,7 @@ export default function BookProcessor() {
   // not have committed yet, so the queue reads empty and the function
   // silently returns — no OCR runs and no error surfaces.
   // ────────────────────────────────────────────────────────────────────
-  const processQueue = useCallback(async (incoming) => {
+  const processQueue = useCallback(async (incoming, payloads) => {
     const queue = Array.isArray(incoming) ? incoming : [];
     if (queue.length === 0) return;
 
@@ -176,14 +182,25 @@ export default function BookProcessor() {
         setCurrentIdx(i);
         addLog('info', `Extracting text from page "${page.name}" (${i + 1}/${queue.length}) via ${modeLabel}…`);
 
+        // Resolve the image payload for OCR: prefer the in-flight map (most
+        // recent batch), fall back to the imageStore cache. When neither has
+        // it (hard refresh / cache eviction), OCR this page is impossible —
+        // mark it failed and move on rather than hanging.
+        let dataUrl = payloads?.get(page.id) || null;
+        if (!dataUrl && page.imageRef) {
+          dataUrl = await getImage(page.imageRef);
+        }
+
         let result;
-        if (ocrMode === 'local') {
-          result = await extractLocal(page.dataUrl, {
+        if (!dataUrl) {
+          result = { ok: false, text: '', error: 'Image payload is no longer available in browser memory.' };
+        } else if (ocrMode === 'local') {
+          result = await extractLocal(dataUrl, {
             lang: toTesseractLang(ocrLanguage),
             signal: controller.signal,
           });
         } else {
-          result = await extractCloud(page.dataUrl, {
+          result = await extractCloud(dataUrl, {
             baseUrl: settings.providerUrl,
             apiKey: settings.apiKey,
             model: settings.modelName,
@@ -205,6 +222,16 @@ export default function BookProcessor() {
           // Append a failure marker so the gap in the book is visible.
           appendText(`--- Page: ${page.name} ---\n[Extraction failed: ${result.error}]`);
           addLog('error', `Page "${page.name}" failed: ${result.error}`);
+        }
+
+        // ─── Memory lifecycle: drop THIS page's image the moment OCR is over ───
+        // Free the in-memory copy for this page and, when the page was cached
+        // in IndexedDB, delete it there too. This is the per-image half of the
+        // requested auto-purge; the batch purge lives in handleClearMemory /
+        // the copy+export paths below.
+        payloads?.delete(page.id);
+        if (page.imageRef) {
+          deleteImage(page.imageRef);
         }
       }
 
@@ -256,17 +283,29 @@ export default function BookProcessor() {
     }
     if (valid.length === 0) return;
 
-    // Build all entries with data URLs before touching state or OCR —
-    // this guarantees the array we pass to processQueue is complete.
+    // Build all entries and persist their payloads to the ephemeral
+    // imageStore BEFORE touching state or OCR. React state keeps only a
+    // lightweight ref (imageRef) — holding multi-MB base64 strings in the point
+    // render tree / context is exactly what we want to avoid; the store is
+    // purged the instant the page is done being OCR'd.
     const entries = [];
     for (const file of valid) {
       try {
         const dataUrl = await fileToDataUrl(file);
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${entries.length}`;
+        const imageRef = `book:${id}`;
+        // Best-effort cache (IndexedDB). If it fails (private mode / quota),
+        // we fall back herein via the local `payloads` map passed to processQueue.
+        await putImage(imageRef, dataUrl);
         entries.push({
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${entries.length}`,
+          id,
           name: file.name,
           size: formatSize(file.size),
-          dataUrl,
+          imageRef,
+          // dataUrl kept on the entry ONLY long enough for addFiles to build
+          // the local payload map below; we null it before the entry is
+          // committed to context so long-lived state doesn't retain it.
+          __dataUrl: dataUrl,
           status: 'queued',
         });
       } catch {
@@ -275,13 +314,21 @@ export default function BookProcessor() {
     }
     if (entries.length === 0) return;
 
-    // Single batched update: push all new entries into the queue at once.
-    setPages(prev => [...prev, ...entries]);
-    addLog('success', `${entries.length} page image(s) added to the book.`);
+    // Local payload map (id → dataUrl) for the OCR processor. We never rely
+    // on re-reading state; this array is the single source of truth for the
+    // queue processor.
+    const payloads = new Map(entries.map(e => [e.id, e.__dataUrl]));
+    const lightEntries = entries.map(({ __dataUrl, ...rest }) => rest);
 
-    // Hand the new entries straight to the processor so it can OCR them
-    // without depending on a (potentially uncommitted) state read.
-    processQueue(entries);
+    // Single batched update: push the LIGHT entries (no dataUrl) into the
+    // queue at once. OCR data comes from the `payloads` map / imageStore,
+    // not from React state.
+    setPages(prev => [...prev, ...lightEntries]);
+    addLog('success', `${lightEntries.length} page image(s) added to the book.`);
+
+    // Hand the new entries + their payloads straight to the processor so it
+    // can OCR them without depending on a (potentially uncommitted) state read.
+    processQueue(lightEntries, payloads);
   }, [addLog, setPages, processQueue]);
 
   // ─── Drag handlers ───
@@ -307,7 +354,11 @@ export default function BookProcessor() {
   const removePage = useCallback((id) => {
     setPages(prev => {
       const target = prev.find(p => p.id === id);
-      if (target) addLog('info', `Page "${target.name}" removed from the queue.`);
+      if (target) {
+        addLog('info', `Page "${target.name}" removed from the queue.`);
+        // Free the cached image payload for the removed page too.
+        if (target.imageRef) deleteImage(target.imageRef);
+      }
       return prev.filter(p => p.id !== id);
     });
   }, [setPages, addLog]);
@@ -332,6 +383,12 @@ export default function BookProcessor() {
         : await exportToPdf(accumulatedText, { filename: 'subscribe-book-export.pdf' });
       if (result.ok) {
         addLog('success', `Exported as ${format.toUpperCase()}${result.filename ? ` (${result.filename})` : ''}.`);
+        // ─── Memory lifecycle ─── A successful DOCX/PDF download is the
+        // canonical "I'm done with these images" signal. Purge the cached
+        // page payloads and clear the queue text-stays so the VPS-hosted
+        // (browser) session doesn't hold multi-MB dataUrls long after use.
+        clearAllImages();
+        setPages([]);
       } else {
         addLog('error', `Export failed: ${result.error}`);
       }
@@ -340,7 +397,7 @@ export default function BookProcessor() {
     } finally {
       setExporting(null);
     }
-  }, [accumulatedText, addLog]);
+  }, [accumulatedText, addLog, setPages]);
 
   // ─── Generate AI Dataset (Phase 2, Task 6) ───────────────────────
   // Real AI-backed dataset generation. Sends the accumulated book text
@@ -467,6 +524,10 @@ export default function BookProcessor() {
       });
       if (res?.ok) {
         addLog('success', `Uploaded "${fileName}" to ${provider === 'googleDrive' ? 'Google Drive' : 'Dropbox'}.`);
+        // Same lifecycle as copy/export — the text is now safely in the
+        // cloud, so release the source page images.
+        clearAllImages();
+        setPages([]);
       } else {
         addLog('error', `Cloud upload failed: ${res?.error || 'unknown error'}`);
       }
@@ -475,7 +536,7 @@ export default function BookProcessor() {
     } finally {
       setCloudUploading(null);
     }
-  }, [accumulatedText, cloud, addLog]);
+  }, [accumulatedText, cloud, addLog, setPages]);
 
   // Refresh cloud-connection state the moment the export modal opens so the
   // provider buttons never show a stale "Not connected" from a prior session.
@@ -495,6 +556,8 @@ export default function BookProcessor() {
     }
     setCurrentIdx(-1);
     clearAll();
+    // Also drop every cached page image from the imageStore.
+    clearAllImages();
     addLog('info', 'Temporary memory cleared — extracted text and page queue reset.');
   }, [clearAll, addLog]);
 
@@ -575,6 +638,7 @@ export default function BookProcessor() {
                 <button
                   onClick={() => {
                     setPages([]);
+                    clearAllImages();
                     addLog('info', 'Page queue cleared.');
                   }}
                   className="text-[10px] font-medium text-surface-500 hover:text-red-400 transition-colors"
@@ -601,7 +665,7 @@ export default function BookProcessor() {
                         }`}
                     >
                       <div className="aspect-[3/4] bg-surface-800/60 overflow-hidden relative">
-                        <img src={page.dataUrl} alt={page.name} className="w-full h-full object-cover" />
+                        <PageThumb page={page} />
                         {/* Processing overlay */}
                         {isCurrent && (
                           <div className="absolute inset-0 bg-brand-950/70 flex items-center justify-center backdrop-blur-sm">
@@ -753,7 +817,15 @@ export default function BookProcessor() {
               <button
                 onClick={() => {
                   navigator.clipboard?.writeText(accumulatedText)
-                    .then(() => addLog('info', 'Accumulated text copied to clipboard.'))
+                    .then(() => {
+                      addLog('info', 'Accumulated text copied to clipboard.');
+                      // ─── Memory lifecycle ─── Copy is an end-of-use action:
+                      // once the text is on the clipboard the source images are
+                      // no longer needed. Purge the imageStore cache AND clear
+                      // the page queue (text stays) so browser memory stays lean.
+                      clearAllImages();
+                      setPages([]);
+                    })
                     .catch(() => addLog('warning', 'Clipboard not available.'));
                 }}
                 className="text-[10px] font-medium text-brand-400 hover:text-brand-300 transition-colors flex items-center gap-1"
@@ -820,6 +892,41 @@ function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+/**
+ * PageThumb — lazy-loads a page's base64 image from the imageStore by its
+ * `imageRef`, so the queue's React state can stay payload-free. Falls back
+ * to a faded placeholder while loading or if the image was already purged.
+ */
+function PageThumb({ page }) {
+  const [src, setSrc] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Back-compat: an entry that still carries an inline dataUrl (e.g. from
+    // before this change in the same session) renders it directly.
+    if (page.dataUrl) {
+      setSrc(page.dataUrl);
+      return;
+    }
+    if (!page.imageRef) return;
+    getImage(page.imageRef).then((dataUrl) => {
+      if (!cancelled) setSrc(dataUrl);
+    });
+    return () => { cancelled = true; };
+  }, [page.dataUrl, page.imageRef]);
+
+  if (!src) {
+    return (
+      <div className="w-full h-full flex items-center justify-center text-surface-700">
+        <svg className="w-5 h-5 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+      </div>
+    );
+  }
+  return <img src={src} alt={page.name} className="w-full h-full object-cover" />;
 }
 
 /**

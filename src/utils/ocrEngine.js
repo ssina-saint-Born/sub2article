@@ -45,10 +45,16 @@ export async function extractLocal(dataUrl, options = {}) {
   const { lang = 'eng', onProgress, signal } = options;
 
   // ─── Desktop path: delegate to the main process via the bridge ───
-  // In the web build, `bridge.ocr.run` resolves { ok:false, error } so
-  // this block returns the "use Cloud AI mode" message — no throw.
-  const api = bridge;
-  if (api?.ocr?.run) {
+  // CRITICAL (web build): this guard MUST be Electron-only. In the web
+  // build `bridge.ocr.run` is the *browser* implementation (webBridge),
+  // whose job is to hand the work BACK to load tesseract.js WASM (see the
+  // "Browser fallback" below). If we let the web webBridge enter this
+  // branch, `extractLocal` → webBridge.ocr.run → `extractLocal` → ...
+  // recurses forever and freezes the tab (the exact "website crashes and
+  // stays frozen" symptom). In Electron the real preload API is present so
+  // we DO delegate to the main-process worker here.
+  const api = isElectron() ? bridge : null;
+  if (api && typeof api.ocr?.run === 'function') {
     // Honor a pre-aborted signal immediately.
     if (signal?.aborted) return { ok: false, text: '', error: 'Cancelled.' };
 

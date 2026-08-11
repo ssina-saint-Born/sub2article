@@ -2,6 +2,7 @@ import React, { useState, useCallback, useRef } from 'react';
 import { useLog } from '../../contexts/LogContext';
 import { useSettings } from '../../hooks/useSettings';
 import { extractLocal, extractCloud, fileToDataUrl, toTesseractLang, OCR_LANGS } from '../../utils/ocrEngine';
+import { putImage, getImage, deleteImage, clearAllImages } from '../../utils/imageStore';
 import bridge from '../../utils/bridge';
 import { isElectron } from '../../utils/env';
 
@@ -28,7 +29,7 @@ export default function ImageOCR() {
   const { addLog } = useLog();
   const { settings } = useSettings();
 
-  const [images, setImages] = useState([]);          // [{ id, file, dataUrl, name, size }]
+  const [images, setImages] = useState([]);          // [{ id, imageRef, name, size }] — payloads live in imageStore, not here
   const [dragActive, setDragActive] = useState(false);
   const [ocrMode, setOcrMode] = useState('local');   // 'local' | 'cloud'
   const [exportFormat, setExportFormat] = useState('txt'); // 'txt' | 'doc'
@@ -41,6 +42,10 @@ export default function ImageOCR() {
   const [copied, setCopied] = useState(false);
   const abortRef = useRef(null);
   const fileInputRef = useRef(null);
+  // In-flight payloads (id → dataUrl) for the CURRENT extraction batch.
+  // The imageStore is the persistence layer; this map is the synchronous
+  // fast-path so `handleExtract` doesn't need an `await` per image read.
+  const payloadsRef = useRef(new Map());
 
   // The shared OCR_LANGUAGES from the module import above is the source of
   // truth — includes Persian (فارسی) and the 'English + Persian' multi-lang
@@ -71,15 +76,21 @@ export default function ImageOCR() {
 
     if (valid.length === 0) return;
 
-    // Build image entries with data URLs
+    // Build image entries and persist payloads to the ephemeral imageStore.
+    // React state holds only metadata + an imageRef (the multi-MB base64 lives
+    // in IndexedDB, not the render tree). A parallel in-memory payload map is
+    // kept in a ref so extraction never depends on async cache reads.
     const newEntries = await Promise.all(
       valid.map(async (file) => {
         try {
           const dataUrl = await fileToDataUrl(file);
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const imageRef = `imgocr:${id}`;
+          await putImage(imageRef, dataUrl); // best-effort; payloadsRef is the fast path
+          payloadsRef.current.set(id, dataUrl);
           return {
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            file,
-            dataUrl,
+            id,
+            imageRef,
             name: file.name,
             size: file.size,
           };
@@ -118,7 +129,11 @@ export default function ImageOCR() {
   const removeImage = useCallback((id) => {
     setImages(prev => {
       const target = prev.find(i => i.id === id);
-      if (target) addLog('info', `Image "${target.name}" removed from queue.`);
+      if (target) {
+        addLog('info', `Image "${target.name}" removed from queue.`);
+        if (target.imageRef) deleteImage(target.imageRef);
+        payloadsRef.current.delete(id);
+      }
       return prev.filter(i => i.id !== id);
     });
   }, [addLog]);
@@ -126,6 +141,8 @@ export default function ImageOCR() {
   const clearAll = useCallback(() => {
     setImages([]);
     setCombinedText('');
+    payloadsRef.current.clear();
+    clearAllImages();
     addLog('info', 'Image queue cleared.');
   }, [addLog]);
 
@@ -156,9 +173,19 @@ export default function ImageOCR() {
         setLocalProgress(0);
         addLog('info', `Extracting text from image ${i + 1} of ${images.length} via ${modeLabel}...`);
 
+        // Resolve the payload: in-memory map first, then the IndexedDB cache.
+        // If neither has it (e.g. cache eviction mid-session) the page is
+        // marked failed below instead of hanging OCR on an undefined image.
+        let dataUrl = payloadsRef.current.get(img.id) || null;
+        if (!dataUrl && img.imageRef) {
+          dataUrl = await getImage(img.imageRef);
+        }
+
         let result;
-        if (ocrMode === 'local') {
-          result = await extractLocal(img.dataUrl, {
+        if (!dataUrl) {
+          result = { ok: false, text: '', error: 'Image payload is no longer available in browser memory.' };
+        } else if (ocrMode === 'local') {
+          result = await extractLocal(dataUrl, {
             lang: toTesseractLang(ocrLanguage),
             onProgress: (p) => setLocalProgress(p),
             signal: controller.signal,
@@ -169,7 +196,7 @@ export default function ImageOCR() {
             addLog('error', 'API Key or Base URL is missing. Please check your Settings.');
             break;
           }
-          result = await extractCloud(img.dataUrl, {
+          result = await extractCloud(dataUrl, {
             baseUrl: settings.providerUrl,
             apiKey: settings.apiKey,
             model: settings.modelName,
@@ -194,6 +221,13 @@ export default function ImageOCR() {
           setCombinedText(combined);
           addLog('error', `Image ${i + 1} (${img.name}) failed: ${result.error}`);
         }
+
+        // ─── Memory lifecycle: drop THIS image's payload the moment its OCR
+        // is over (success or fail). The final batch purge happens if/when
+        // the user copies, exports, or clears — but we never hold the bytes
+        // in memory past the point of use regardless.
+        payloadsRef.current.delete(img.id);
+        if (img.imageRef) deleteImage(img.imageRef);
       }
 
       if (results.length > 0 && !controller.signal.aborted) {
@@ -282,6 +316,10 @@ export default function ImageOCR() {
           );
           if (writeResult.ok) {
             addLog('success', `Exported to "${result.path.split(/[\\/]/).pop()}".`);
+            // ─── Memory lifecycle ─── Export is end-of-use; purge images.
+            payloadsRef.current.clear();
+            clearAllImages();
+            setImages([]);
           } else {
             addLog('error', `Export failed: ${writeResult.error}`);
           }
@@ -304,6 +342,11 @@ export default function ImageOCR() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     addLog('success', `Exported as ${defaultName} via browser download.`);
+    // ─── Memory lifecycle ─── Export is end-of-use; purge images. The text
+    // stays visible until the user clears it, but the source bytes are gone.
+    payloadsRef.current.clear();
+    clearAllImages();
+    setImages([]);
   }, [combinedText, exportFormat, addLog]);
 
   // ─── Copy ───
@@ -313,7 +356,14 @@ export default function ImageOCR() {
       await navigator.clipboard.writeText(combinedText);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-      addLog('info', 'Extracted text copied to clipboard.');
+      addLog('info', 'Extracted text copied to clipboard. Source images purged from memory.');
+      // ─── Memory lifecycle ─── Copy is an end-of-use action: the extracted
+      // text is on the clipboard, so we purge both the queue and the cached
+      // page images. The combinedText is retained for display until the user
+      // clears it explicitly.
+      payloadsRef.current.clear();
+      clearAllImages();
+      setImages([]);
     } catch {
       addLog('warning', 'Clipboard not available.');
     }
@@ -406,7 +456,7 @@ export default function ImageOCR() {
                       `}
                     >
                       <div className="aspect-square bg-surface-800/60 overflow-hidden relative">
-                        <img src={img.dataUrl} alt={img.name} className="w-full h-full object-cover" />
+                        <ImageThumb img={img} />
                         {/* Processing overlay */}
                         {isProcessing && (
                           <div className="absolute inset-0 bg-purple-950/70 flex flex-col items-center justify-center backdrop-blur-sm">
@@ -695,4 +745,37 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/**
+ * ImageThumb — lazy-loads an image's base64 payload from the imageStore by
+ * its `imageRef`, so the queue's React state can stay payload-free. Falls
+ * back to a faded placeholder while loading or if the image was already purged.
+ */
+function ImageThumb({ img }) {
+  const [src, setSrc] = useState(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    if (img.dataUrl) {
+      setSrc(img.dataUrl);
+      return;
+    }
+    if (!img.imageRef) return;
+    getImage(img.imageRef).then((dataUrl) => {
+      if (!cancelled) setSrc(dataUrl);
+    });
+    return () => { cancelled = true; };
+  }, [img.dataUrl, img.imageRef]);
+
+  if (!src) {
+    return (
+      <div className="w-full h-full flex items-center justify-center text-surface-700">
+        <svg className="w-5 h-5 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+      </div>
+    );
+  }
+  return <img src={src} alt={img.name} className="w-full h-full object-cover" />;
 }

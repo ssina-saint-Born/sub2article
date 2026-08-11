@@ -126,17 +126,40 @@ const webBridge = {
   // ─── OCR ───
   // REAL implementation: run tesseract.js in the browser via WASM.
   // Lazy-imported so we don't pay the WASM cost until OCR is actually used.
-  // `ocrEngine.extractLocal` handles Electron-vs-web paths itself; here we
-  // just delegate so bridge.ocr.run works like the desktop's main-process
-  // IPC handler.
+  //
+  // IMPORTANT: this does NOT call `ocrEngine.extractLocal`. That function's
+  // web path is what creates the worker; routing back through it would
+  // (because `isElectron()` is false here, this webBridge's own `ocr.run`
+  // exists) loop `extractLocal → webBridge.ocr.run → extractLocal → …`
+  // forever. This cascade is the frozen-tab crash the user reported on the
+  // VPS/Coolify (static web) deploy. Instead we create the WASM worker
+  // right here — the true browser-native equivalent of the desktop's
+  // main-process OCR IPC handler.
   ocr: {
     run: async ({ dataUrl, lang = 'eng', onProgress } = {}) => {
-      // Lazy circular-friendly import: ocrEngine imports bridge, so we
-      // dynamically import ocrEngine here ONLY when OCR runs in the browser.
-      // On the web build tesseract.js is bundled as a Vite lazy chunk; on
-      // Electron this code path is never reached (bridge === electronAPI).
-      const { extractLocal } = await import('./ocrEngine');
-      return extractLocal(dataUrl, { lang, onProgress });
+      let worker = null;
+      try {
+        const { default: Tesseract } = await import('tesseract.js');
+        worker = await Tesseract.createWorker(lang, 1, {
+          // Pin to the installed version so CDN URLs never drift.
+          workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@7/dist/worker.min.js',
+          corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@7/tesseract-core.wasm.js',
+          langPath:   'https://tessdata.projectnaptha.com/4.0.0',
+          logger: (m) => {
+            if (m.status === 'recognizing text' && typeof onProgress === 'function') {
+              onProgress(typeof m.progress === 'number' ? m.progress : 0);
+            }
+          },
+        });
+        const { data } = await worker.recognize(dataUrl);
+        return { ok: true, text: (data?.text || '').trim() };
+      } catch (err) {
+        return { ok: false, text: '', error: err?.message || String(err) };
+      } finally {
+        if (worker) {
+          try { await worker.terminate(); } catch { /* ignore */ }
+        }
+      }
     },
     // Tesseract.js v7's createWorker doesn't expose an AbortSignal at the
     // worker level; the extractor already handles cancellation by dropping
