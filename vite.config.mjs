@@ -28,14 +28,19 @@ export default defineConfig({
     strictPort: true,
   },
 
-  // ─── Keep native deps OUT of the renderer bundle ─────────────────────────
-  // tesseract.js runs in the MAIN process (electron/ocrWorker.js). The
-  // browser-fallback import() in src/utils/ocrEngine.js is only reached
-  // outside Electron, so we mark it external to stop Vite/Rollup from
-  // emitting a renderer chunk for it. That chunk previously caused the
-  // production black screen: Vite rewrote the dynamic import with
-  // `import.meta.url`, which under file:// + asar cannot resolve the
-  // Tesseract worker script or WASM core, so createWorker() hung forever.
+  // ─── Keep native deps OUT of the renderer bundle (desktop only) ────────────
+  // tesseract.js runs in the MAIN process (electron/ocrWorker.js). In Electron
+  // mode, the render-side `await import('tesseract.js')` browser-fallback is
+  // never reached because bridge.ocr.run (IPC) is used instead — so marking
+  // it external prevents Vite/Rollup from bundling an extra ~5MB renderer
+  // chunk we don't need, while still letting the dev server resolve it.
+  //
+  // BUILD-TARGETED: when BUILD_TARGET !== 'desktop', the `external` entry is
+  // REMOVED so the dynamic `await import('tesseract.js')` in the browser
+  // fallback becomes a real lazy-loaded chunk shipped into dist/assets/.
+  // That chunk is what runs local OCR in the web build (WASM worker +
+  // tessdata over CDN, paths overridden in src/utils/ocrEngine.js). The
+  // desktop build passes BUILD_TARGET=desktop and keeps the external entry.
   optimizeDeps: {
     exclude: ['tesseract.js'],
   },
@@ -46,7 +51,8 @@ export default defineConfig({
     // Avoid transpiling dynamic import() into a URL-relative helper.
     target: 'esnext',
     rollupOptions: {
-      external: ['tesseract.js'],
+      // Only external in desktop builds — see comment above.
+      external: process.env.BUILD_TARGET === 'desktop' ? ['tesseract.js'] : [],
       output: {
         // Force a single entry chunk for the renderer — no orphaned
         // sibling chunks that could be referenced by an absolute URL.

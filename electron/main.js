@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs/promises');
 
@@ -174,6 +174,21 @@ ipcMain.handle('dialog:save', async (_event, options = {}) => {
 ipcMain.handle('app:platform', () => process.platform);
 ipcMain.handle('app:version', () => app.getVersion());
 
+// Open an external URL in the user's default browser. The renderer cannot
+// do this itself — clicking an `<a target="_blank">` would otherwise load
+// the URL inside our frameless app window. Returns { ok, error? }.
+ipcMain.handle('app:open-external', async (_event, url) => {
+  try {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      throw new Error('Only http(s) URLs may be opened externally.');
+    }
+    await shell.openExternal(url);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC: OCR (Tesseract runs in the MAIN process to avoid file:// + asar
 // worker/WASM resolution failures that black-screen the renderer.)
@@ -193,4 +208,63 @@ ipcMain.handle('ocr:run', async (event, payload) => {
 ipcMain.handle('ocr:cancel', async () => {
   await ocr.cancelOcr();
   return { ok: true };
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IPC: Cloud storage (Google Drive / Dropbox OAuth + upload)
+//
+// Channel naming follows the existing `namespace:action` convention. All
+// handlers return { ok, ...payload, error? } so the renderer can log through
+// its useLog() System Console uniformly (the main process has no visibility
+// into React state).
+// ─────────────────────────────────────────────────────────────────────────────
+const cloud = require('./cloud');
+
+ipcMain.handle('cloud:status', async (_event, provider) => {
+  try {
+    return await cloud.getStatus(provider);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('cloud:connect', async (_event, provider) => {
+  try {
+    return await cloud.connect(provider);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('cloud:disconnect', async (_event, provider) => {
+  try {
+    return await cloud.disconnect(provider);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('cloud:upload', async (event, payload) => {
+  try {
+    const { provider, fileName, buffer, mimeType } = payload || {};
+    const sender = event.sender;
+    const onProgress = (progress) => {
+      if (!sender.isDestroyed()) sender.send('cloud:upload-progress', { provider, fileName, progress });
+    };
+    // `buffer` arrives from the renderer as a serialized Buffer (Node IPC
+    // preserves typed-array/buffer payloads across the context bridge).
+    return await cloud.upload({ provider, fileName, buffer, mimeType, onProgress });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Convenience: does the OS keychain (safeStorage) exist? The renderer uses
+// this to warn if secrets fall back to plaintext on this platform.
+ipcMain.handle('creds:encryption-available', async () => {
+  try {
+    return { ok: true, available: await cloud.credentialsAvailable() };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
 });

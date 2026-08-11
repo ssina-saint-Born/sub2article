@@ -1,7 +1,15 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { useLog } from '../../contexts/LogContext';
 import { useSettings } from '../../hooks/useSettings';
-import { extractLocal, extractCloud, fileToDataUrl, toTesseractLang } from '../../utils/ocrEngine';
+import { extractLocal, extractCloud, fileToDataUrl, toTesseractLang, OCR_LANGS } from '../../utils/ocrEngine';
+import bridge from '../../utils/bridge';
+import { isElectron } from '../../utils/env';
+
+// ─── OCR language options (shared with BookProcessor) ───
+// Now includes Persian (فارسی) and multi-language support (English + Persian).
+// The state value remains the human-readable label; toTesseractLang()
+// translates it to a code (eng / fas / eng+fas / ara / ...).
+const OCR_LANGUAGES = OCR_LANGS.map((l) => l.label);
 
 const VALID_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp'];
 const MIME_PREFIX = 'image/';
@@ -34,8 +42,10 @@ export default function ImageOCR() {
   const abortRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  const OCR_LANGUAGES = ['English', 'Persian (فارسی)', 'Spanish (Español)', 'French (Français)',
-    'German (Deutsch)', 'Arabic (العربية)', 'Chinese (中文)', 'Japanese (日本語)'];
+  // The shared OCR_LANGUAGES from the module import above is the source of
+  // truth — includes Persian (فارسی) and the 'English + Persian' multi-lang
+  // option. The dropdown component below renders from OCR_LANGS directly.
+  const langChoices = OCR_LANGUAGES;
 
   // ─── Add files (from drop or input) ───
   const addFiles = useCallback(async (fileList) => {
@@ -223,7 +233,7 @@ export default function ImageOCR() {
       return;
     }
 
-    const api = window.electronAPI;
+    const api = bridge;
     let blob;
     let defaultName;
     let extension;
@@ -247,7 +257,11 @@ export default function ImageOCR() {
     }
 
     // ─── Native save dialog path (Electron) ───
-    if (api?.fs?.showSaveDialog && api?.fs?.writeFile) {
+    // Gate on isElectron() — in Web Mode the mock's showSaveDialog /
+    // writeFile methods exist (so a pure existence guard would pass),
+    // but they can't actually write to disk. We must fall through to
+    // the browser blob download below instead.
+    if (isElectron() && api?.fs?.showSaveDialog && api?.fs?.writeFile) {
       try {
         const result = await api.fs.showSaveDialog({
           title: 'Save OCR Export',
@@ -476,14 +490,12 @@ export default function ImageOCR() {
                 <label className="block text-[10px] font-semibold text-surface-500 uppercase tracking-wider mb-1.5">
                   OCR Language (Tesseract)
                 </label>
-                <select
+                <LangSelect
                   value={ocrLanguage}
-                  onChange={(e) => setOcrLanguage(e.target.value)}
+                  onChange={setOcrLanguage}
+                  options={langChoices}
                   disabled={isExtracting}
-                  className="w-full bg-surface-800/60 border border-surface-700/50 rounded-lg px-3 py-2 text-xs text-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-500/40 cursor-pointer"
-                >
-                  {OCR_LANGUAGES.map(lang => <option key={lang} value={lang}>{lang}</option>) }
-                </select>
+                />
               </div>
             )}
 
@@ -595,6 +607,84 @@ export default function ImageOCR() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ─── Reusable OCR-language picker (premium dark dropdown) ───
+   Self-contained so both ImageOCR and BookProcessor can import the same
+   component without a new file. RTL labels (فارسی) are rendered with the
+   `dir="rtl"` attribute so Persian glyphs don't fragment.
+
+   API:
+     value      — the currently-selected human-readable label (e.g. 'English')
+     onChange   — (label) => void
+     options    — string[] of labels (defaults to the shared OCR_LANGS list)
+     disabled   — dims the control while OCR is running              */
+export function LangSelect({ value, onChange, options = OCR_LANGS.map((o) => o.label), disabled = false }) {
+  const [open, setOpen] = React.useState(false);
+  const containerRef = React.useRef(null);
+
+  // Close on outside click
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (containerRef.current && !containerRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  // Close on Escape
+  React.useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  const isFa = (label) => label.includes('فارسی');
+
+  return (
+    <div ref={containerRef} className="relative">
+      {/* Trigger button */}
+      <button
+        onClick={() => !disabled && setOpen((o) => !o)}
+        disabled={disabled}
+        className={`w-full flex items-center justify-between px-3 py-2 text-xs rounded-lg transition-all duration-200
+          ${disabled
+            ? 'bg-surface-800/30 border border-surface-700/30 text-surface-600 cursor-not-allowed'
+            : 'bg-surface-800/60 border border-surface-700/50 text-surface-200 hover:bg-surface-800/80 hover:border-surface-600/60 cursor-pointer'
+          }`}
+      >
+        <span dir={isFa(value) ? 'rtl' : 'ltr'}>{value}</span>
+        <svg
+          className={`w-3.5 h-3.5 text-surface-500 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+          fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {/* Dropdown panel */}
+      {open && (
+        <div className="absolute z-20 mt-1.5 w-full rounded-lg bg-surface-900/95 border border-surface-700/60 glow-lg shadow-xl backdrop-blur-sm overflow-hidden animate-fade-in">
+          <div className="max-h-48 overflow-y-auto py-1">
+            {options.map((label) => (
+              <button
+                key={label}
+                onClick={() => { onChange(label); setOpen(false); }}
+                dir={isFa(label) ? 'rtl' : 'ltr'}
+                className={`w-full text-left px-3 py-1.5 text-xs transition-colors duration-100
+                  ${label === value
+                    ? 'bg-brand-600/20 text-brand-300'
+                    : 'text-surface-300 hover:bg-surface-800/60 hover:text-surface-100'
+                  }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,3 +1,6 @@
 node_modules/
 dist/
 release/
+electron/cloud/cloud.providers.json
+electron/cloud-tokens.json
+nul

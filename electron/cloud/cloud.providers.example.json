@@ -1,0 +1,12 @@
+{
+  "googleDrive": {
+    "clientId": "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com",
+    "clientSecret": "YOUR_GOOGLE_CLIENT_SECRET",
+    "redirectUri": "http://localhost:8765/"
+  },
+  "dropbox": {
+    "appKey": "YOUR_DROPBOX_APP_KEY",
+    "appSecret": "YOUR_DROPBOX_APP_SECRET",
+    "redirectUri": "http://localhost:8765/"
+  }
+}

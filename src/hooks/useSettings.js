@@ -4,11 +4,27 @@ const STORAGE_KEY = 'subscribe-ai-settings';
 
 // ─── Default configuration values ───
 const DEFAULTS = {
+  // AI Provider
   providerUrl: 'https://api.openai.com/v1',
   apiKey: '',
   modelName: 'gpt-4o',
   autoSave: true,
   notifications: false,
+  // Cloud Storage Integrations
+  // OAuth tokens themselves live in the Electron main-process secure store
+  // (safeStorage-encrypted, see electron/cloud/credentialsManager.js) — they
+  // are NEVER placed in localStorage. Settings only carries a non-sensitive
+  // mirror: a boolean connection flag plus the account email/label captured
+  // at connect-time, so the Settings badge can hydrate instantly on launch.
+  googleDriveConnected: false,
+  googleDriveAccount: '',
+  dropboxConnected: false,
+  dropboxAccount: '',
+  megaEmail: '',
+  megaPassword: '',
+  webdavUrl: '',
+  webdavUser: '',
+  webdavPassword: '',
 };
 
 /**

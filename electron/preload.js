@@ -46,6 +46,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   app: {
     getPlatform: () => ipcRenderer.invoke('app:platform'),
     getVersion: () => ipcRenderer.invoke('app:version'),
+    // Open http(s) URLs in the user's default web browser. Returns { ok, error? }.
+    // Required because `<a target="_blank">` would otherwise load inside the
+    // frameless app window — call this from onClick handlers for external links.
+    openExternal: (url) => ipcRenderer.invoke('app:open-external', url),
   },
 
   // ─── OCR (Tesseract runs in the main process) ───
@@ -64,5 +68,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
     // Cancel any in-flight OCR run.
     cancel: () => ipcRenderer.invoke('ocr:cancel'),
+  },
+
+  // ─── Cloud storage (Google Drive / Dropbox OAuth + upload) ───
+  cloud: {
+    // Query connection state. Returns { ok, connected, account }.
+    status: (provider) => ipcRenderer.invoke('cloud:status', provider),
+    // Start the OAuth flow. Returns { ok, account? , error? }.
+    connect: (provider) => ipcRenderer.invoke('cloud:connect', provider),
+    // Revoke + clear tokens. Returns { ok, warning? , error? }.
+    disconnect: (provider) => ipcRenderer.invoke('cloud:disconnect', provider),
+    // Upload a file. `buffer` is a Uint8Array/Buffer (Node IPC preserves it).
+    // onProgress(p) receives 0..1 progress; listener is removed after the call.
+    upload: ({ provider, fileName, buffer, mimeType, onProgress } = {}) => {
+      const handler = (_e, p) => {
+        if (typeof onProgress === 'function') onProgress(p);
+      };
+      ipcRenderer.on('cloud:upload-progress', handler);
+      return ipcRenderer
+        .invoke('cloud:upload', { provider, fileName, buffer, mimeType })
+        .finally(() => ipcRenderer.removeListener('cloud:upload-progress', handler));
+    },
+    // True when the OS keychain (safeStorage) is encrypting tokens.
+    isEncryptionAvailable: () => ipcRenderer.invoke('creds:encryption-available'),
   },
 });

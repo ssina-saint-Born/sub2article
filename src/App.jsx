@@ -2,18 +2,21 @@ import React, { useState, useCallback } from 'react';
 
 // ─── Contexts ───
 import { LogProvider, useLog } from './contexts/LogContext';
+import { BookProvider } from './contexts/BookContext';
 
 // ─── Components ───
 import Sidebar from './components/Sidebar';
 import TitleBar from './components/TitleBar';
 import SubtitleProcessor from './components/tabs/SubtitleProcessor';
 import ImageOCR from './components/tabs/ImageOCR';
+import BookProcessor from './components/tabs/BookProcessor';
 import Settings from './components/tabs/Settings';
 import SystemLogs from './components/SystemLogs';
 
 const TABS = [
   { id: 'subtitle', label: 'Subtitle Processor', icon: 'subtitle' },
   { id: 'ocr', label: 'Image OCR Extractor', icon: 'ocr' },
+  { id: 'book', label: 'Book to Digital', icon: 'book' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -45,6 +48,8 @@ function AppShell() {
         return <SubtitleProcessor />;
       case 'ocr':
         return <ImageOCR />;
+      case 'book':
+        return <BookProcessor />;
       case 'settings':
         return <Settings />;
       default:
@@ -88,13 +93,17 @@ function AppShell() {
 }
 
 /**
- * Root component — wraps everything in <LogProvider>
- * so any child component anywhere in the tree can call useLog().
+ * Root component — wraps everything in <LogProvider> and <BookProvider>
+ * so any child component anywhere in the tree can call useLog() / useBook().
+ * BookProvider lives here (above AppShell) so the accumulated book text
+ * survives tab switches, which remount the tab components.
  */
 export default function App() {
   return (
     <LogProvider>
-      <AppShell />
+      <BookProvider>
+        <AppShell />
+      </BookProvider>
     </LogProvider>
   );
 }

@@ -14,8 +14,17 @@
  *                       works on handwriting & complex layouts.
  *
  * Both functions accept a data URL and return clean extracted text.
+ *
+ * Environment: `extractLocal()` reaches the main-process OCR worker via
+ * `bridge.ocr.run` (the environment-aware proxy in src/utils/bridge.js).
+ * In the Electron build `bridge` IS `window.electronAPI`; in the web
+ * build it's the browser-native tesseract.js WASM worker with explicit
+ * CDN paths for the worker script/core/language packs. Cloud OCR
+ * (`extractCloud`) is pure fetch and works in both modes.
  * ─────────────────────────────────────────────────────────────
  */
+import bridge from './bridge';
+import { isElectron } from './env';
 
 /**
  * Run Tesseract.js OCR on a single image.
@@ -35,8 +44,10 @@
 export async function extractLocal(dataUrl, options = {}) {
   const { lang = 'eng', onProgress, signal } = options;
 
-  // ─── Electron path: delegate to the main process ───
-  const api = typeof window !== 'undefined' && window.electronAPI;
+  // ─── Desktop path: delegate to the main process via the bridge ───
+  // In the web build, `bridge.ocr.run` resolves { ok:false, error } so
+  // this block returns the "use Cloud AI mode" message — no throw.
+  const api = bridge;
   if (api?.ocr?.run) {
     // Honor a pre-aborted signal immediately.
     if (signal?.aborted) return { ok: false, text: '', error: 'Cancelled.' };
@@ -59,12 +70,32 @@ export async function extractLocal(dataUrl, options = {}) {
     }
   }
 
-  // ─── Browser fallback: direct dynamic import (dev/preview only) ───
+  // ─── Browser fallback: direct dynamic import (Web build path) ──────────────
+  // In Electron, the renderer-side `await import('tesseract.js')` hangs under
+  // file:// + asar because Vite rewrites it with `import.meta.url`. In the WEB
+  // build we're over plain http(s), so tesseract.js CAN load its worker and
+  // WASM — but not by `import.meta.url` (Vite bundles it as a chunk whose
+  // URL never matches another file). We hand-create the worker with explicit
+  // CDN URLs for the worker script, the WASM core, and the tessdata language
+  // packs (language codes like 'eng', 'fas', or 'eng+fas' pull from langPath).
+  //
+  // vite.config.mjs keeps `optimizeDeps.exclude` in place (so Vite dev doesn't
+  // pre-bundle it), but removes `rollupOptions.external` in web builds so the
+  // lazy dynamic import emits a real chunk shipped to dist/assets/.
   let worker = null;
   try {
     const { default: Tesseract } = await import('tesseract.js');
 
+    const isWeb = !isElectron();
     worker = await Tesseract.createWorker(lang, 1, {
+      ...(isWeb && {
+        // Pin to the installed version so the CDN URLs never drift.
+        workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@7/dist/worker.min.js',
+        corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@7/tesseract-core.wasm.js',
+        langPath:   'https://tessdata.projectnaptha.com/4.0.0',
+        // Language packs are downloaded per-code ('eng', 'fas', ...). gzip
+        // encoding is handled automatically by the fetch of .traineddata.gz.
+      }),
       logger: (m) => {
         if (m.status === 'recognizing text' && onProgress) {
           onProgress(typeof m.progress === 'number' ? m.progress : 0);
@@ -189,12 +220,17 @@ export function fileToDataUrl(file) {
 }
 
 /**
- * Map a human-readable language label (from the SubtitleProcessor dropdown)
- * to a Tesseract language code. Falls back to 'eng'.
+ * Map a human-readable language label (from the OCR language dropdowns) to a
+ * Tesseract language code. Falls back to 'eng'. The combined "English + Persian"
+ * label maps to the real multi-lang string 'eng+fas' that Tesseract.js accepts.
  */
 export function toTesseractLang(languageLabel) {
   if (!languageLabel) return 'eng';
   const lower = languageLabel.toLowerCase();
+  if (lower.includes('english + persian') ||
+      (lower.includes('english') && lower.includes('persian'))) {
+    return 'eng+fas';
+  }
   if (lower.includes('persian') || lower.includes('فارسی')) return 'fas';
   if (lower.includes('english')) return 'eng';
   if (lower.includes('spanish') || lower.includes('español')) return 'spa';
@@ -209,3 +245,25 @@ export function toTesseractLang(languageLabel) {
   if (lower.includes('portuguese') || lower.includes('português')) return 'por';
   return 'eng';
 }
+
+/**
+ * The OCR language choices shared by every dropdown in the app (ImageOCR,
+ * BookProcessor). `lang` is the raw string handed to Tesseract.createWorker.
+ * 'eng+fas' is the multi-language sum — Tesseract.js natively stitches both
+ * packs and dispatches per-glyph recognition.
+ */
+export const OCR_LANGS = [
+  { value: 'English',                    label: 'English',                    lang: 'eng'       },
+  { value: 'Persian (فارسی)',            label: 'Persian (فارسی)',            lang: 'fas'       },
+  { value: 'English + Persian (فارسی)',  label: 'English + Persian (فارسی)',  lang: 'eng+fas'   },
+  { value: 'Spanish (Español)',          label: 'Spanish (Español)',          lang: 'spa'       },
+  { value: 'French (Français)',          label: 'French (Français)',          lang: 'fra'       },
+  { value: 'German (Deutsch)',           label: 'German (Deutsch)',           lang: 'deu'       },
+  { value: 'Arabic (العربية)',           label: 'Arabic (العربية)',           lang: 'ara'       },
+  { value: 'Chinese (中文)',             label: 'Chinese (中文)',             lang: 'chi_sim'   },
+  { value: 'Japanese (日本語)',          label: 'Japanese (日本語)',          lang: 'jpn'       },
+  { value: 'Korean (한국어)',            label: 'Korean (한국어)',            lang: 'kor'       },
+  { value: 'Turkish (Türkçe)',           label: 'Turkish (Türkçe)',           lang: 'tur'       },
+  { value: 'Hindi (हिन्दी)',             label: 'Hindi (हिन्दी)',             lang: 'hin'       },
+  { value: 'Portuguese (Português)',     label: 'Portuguese (Português)',     lang: 'por'       },
+];

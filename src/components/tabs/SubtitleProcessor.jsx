@@ -6,6 +6,7 @@ import { useSettings } from '../../hooks/useSettings';
 import { parseSubtitle, detectFormat, formatDuration } from '../../utils/subtitleParser';
 import { buildSystemPrompt, buildUserPrompt, getFormatLabel } from '../../utils/prompts';
 import { callLLM } from '../../utils/apiClient';
+import bridge from '../../utils/bridge';
 
 const OUTPUT_TYPES = [
   { id: 'lecture', label: 'Student Lecture Notes', desc: 'Organized study notes with key concepts highlighted' },
@@ -124,7 +125,7 @@ export default function SubtitleProcessor() {
 
   // ─── Click-to-browse: prefer Electron native dialog, fall back to <input> ───
   const handleBrowse = useCallback(async () => {
-    const api = window.electronAPI;
+    const api = bridge;
     // Native dialog path (production / electron:dev)
     if (api?.fs?.showOpenDialog) {
       try {

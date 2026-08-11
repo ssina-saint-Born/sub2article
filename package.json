@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "icon": "node electron/icon.cjs",
     "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron . --dev\"",
-    "electron:build": "vite build && node electron/icon.cjs && node -e \"require('fs').accessSync('dist/index.html')\" && electron-builder",
+    "electron:build": "cross-env BUILD_TARGET=desktop vite build && node electron/icon.cjs && node -e \"require('fs').accessSync('dist/index.html')\" && electron-builder",
     "start": "electron ."
   },
   "build": {
@@ -35,7 +35,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "public/icon.ico"
@@ -54,6 +56,10 @@
     }
   },
   "dependencies": {
+    "docx": "^9.7.1",
+    "dropbox": "^10.44.0",
+    "googleapis": "^174.0.1",
+    "jspdf": "^4.2.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
@@ -64,6 +70,7 @@
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.20",
     "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3",
     "postcss": "^8.4.41",
